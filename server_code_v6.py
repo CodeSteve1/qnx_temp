@@ -155,9 +155,32 @@ def api_generate_ai_summary(pid):
             summary = "ERROR: Llama inference timed out (>120s)."
 
         if output is not None:
+            # Emulate a real terminal: a loading spinner (or any progress
+            # bar) is drawn by repeatedly overwriting the same line with
+            # "\r". A real TTY only ever shows what's after the LAST "\r"
+            # on a line; captured through a pipe, every intermediate frame
+            # survives as literal text instead (this is the source of the
+            # "|-\|/-\|/-\|/..." spinner garbage). Collapse that first.
+            def _collapse_carriage_returns(text):
+                return '\n'.join(
+                    line.split('\r')[-1] for line in text.split('\n')
+                )
+            output = _collapse_carriage_returns(output)
+
             # Clean ANSI terminal color codes (which break string splitting)
             ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
             output = ansi_escape.sub('', output)
+
+            # The loading spinner in this build is redrawn using ANSI
+            # cursor-movement codes rather than plain "\r". Stripping the
+            # escape codes above removes the *redraw instruction* but not
+            # the frames it was supposed to erase, so every spinner frame
+            # survives as literal text back-to-back (e.g. "|-\|/-\|/-\|...").
+            # A real summary never contains a long run of only |, /, -, \,
+            # so strip any such run outright regardless of what control
+            # sequence produced it. Threshold of 6+ avoids touching a
+            # legitimate lone hyphen or slash in normal text.
+            output = re.sub(r'[|/\\-]{6,}', '', output)
 
             # Extract everything after the <|assistant|> tag
             if "<|assistant|>" in output:
@@ -165,11 +188,16 @@ def api_generate_ai_summary(pid):
             else:
                 summary = output.strip()
 
-            # Clean legacy performance logs
-            if "llama_print_timings" in summary:
-                summary = summary.split("llama_print_timings")[0].strip()
+            # llama.cpp prints its own internal diagnostics at shutdown
+            # (llama_print_timings, llama_perf_context_print,
+            # llama_memory_breakdown_print, etc.). Rather than hardcoding
+            # each name, cut at the first line that starts with the
+            # "llama_..._print" pattern used by all of them.
+            diag_match = re.search(r'(?m)^llama_\w*_print', summary)
+            if diag_match:
+                summary = summary[:diag_match.start()].strip()
 
-            # Clean the new performance log format (e.g. [ Prompt: 9.4 t/s | Generation: 4.6 t/s ])
+            # Clean the separate perf-summary format (e.g. [ Prompt: 9.4 t/s | Generation: 4.6 t/s ])
             if "[ Prompt:" in summary:
                 summary = summary.split("[ Prompt:")[0].strip()
 
