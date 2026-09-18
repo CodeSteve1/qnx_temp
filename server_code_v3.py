@@ -9,7 +9,6 @@ app = Flask(__name__)
 DB_FILE = 'patients_db.json'
 
 def load_db():
-    """Load the database from the JSON file."""
     if os.path.exists(DB_FILE):
         with open(DB_FILE, 'r') as f:
             try:
@@ -19,12 +18,10 @@ def load_db():
     return {}
 
 def save_db(db):
-    """Save the database to the JSON file."""
     with open(DB_FILE, 'w') as f:
         json.dump(db, f, indent=4)
 
 def get_or_create_patient(pid):
-    """Fetch existing patient from file or create data embedded with RTCI keys."""
     db = load_db()
     str_pid = str(pid)
     
@@ -102,20 +99,24 @@ def api_generate_ai_summary(pid):
     # Clean string to prevent shell escaping issues
     clean_context = context.replace('"', ' ').replace("'", ' ').replace('\n', ' ')
 
+    # Fixes applied:
+    # 1. -no-cnv : Disables interactive conversation mode
+    # 2. < /dev/null : Pipes null into stdin so it instantly exits after generating
     cmd = (
         "cd /data/home/qnxuser/llama.cpp/ && "
         "export LD_LIBRARY_PATH=`pwd`/bin:$LD_LIBRARY_PATH && "
-        f"bin/llama-cli -m models/qwen3-751.63M-Q4_K_M.gguf -n 120 --log-disable "
-        f"-p \"Summarize this patient concise in 3 points: {clean_context}\" 2>/dev/null"
+        f"bin/llama-cli -m models/qwen3-751.63M-Q4_K_M.gguf -n 120 --log-disable -no-cnv "
+        f"-p \"Summarize this patient concise in 3 points: {clean_context}\" < /dev/null 2>/dev/null"
     )
 
     try:
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
+        # Bumped timeout to 300s. Loading models off SD cards can take 20-40 seconds alone.
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=300)
         output = result.stdout.strip()
         if not output:
             output = "AI inference produced no output."
     except subprocess.TimeoutExpired:
-        output = "ERROR: Llama inference timed out (>120s)."
+        output = "ERROR: Llama inference timed out (>300s)."
     except Exception as e:
         output = f"ERROR: Failed to run inference: {str(e)}"
 
