@@ -1,14 +1,89 @@
 # server_v1.py
 import os
 import json
-import subprocess
-import signal
 import re
+import subprocess
+import threading
+import time
+import urllib.request
+import urllib.error
 from flask import Flask, jsonify, request, render_template_string, redirect, url_for, Response
 
 app = Flask(__name__)
 
 DB_FILE = 'patients_db.json'
+
+# --- LLAMA-SERVER (persistent, HTTP-based inference) ---
+# We used to shell out to `llama-cli` per request and scrape its terminal
+# output. That's fragile by nature: llama-cli is designed to be watched by
+# a human in a terminal (loading spinner, ASCII banner, shutdown memory
+# diagnostics), not to be parsed by a program, and every request reloaded
+# the whole model from disk. `llama-server` keeps the model resident in
+# memory and exposes a plain HTTP/JSON API, so there's no terminal output
+# to clean up at all -- we just get the generated text back directly.
+LLAMA_DIR = "/data/home/qnxuser/llama.cpp"
+LLAMA_MODEL = "models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
+LLAMA_SERVER_HOST = "127.0.0.1"
+LLAMA_SERVER_PORT = 8080
+LLAMA_SERVER_URL = f"http://{LLAMA_SERVER_HOST}:{LLAMA_SERVER_PORT}"
+LLAMA_SERVER_LOG = "/tmp/llama_server.log"
+
+_llama_server_lock = threading.Lock()
+_llama_server_proc = None
+
+
+def _llama_server_healthy(timeout=1.5):
+    try:
+        with urllib.request.urlopen(f"{LLAMA_SERVER_URL}/health", timeout=timeout) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def ensure_llama_server_running(startup_timeout=120):
+    """Start llama-server once, in the background, if it isn't already up.
+    Safe to call on every request -- it's a no-op once the server is healthy."""
+    global _llama_server_proc
+
+    if _llama_server_healthy():
+        return
+
+    with _llama_server_lock:
+        if _llama_server_healthy():
+            return
+
+        if _llama_server_proc is None or _llama_server_proc.poll() is not None:
+            env = os.environ.copy()
+            env["LD_LIBRARY_PATH"] = os.path.join(LLAMA_DIR, "bin") + ":" + env.get("LD_LIBRARY_PATH", "")
+
+            log_f = open(LLAMA_SERVER_LOG, "a")
+            _llama_server_proc = subprocess.Popen(
+                [
+                    "bin/llama-server",
+                    "-m", LLAMA_MODEL,
+                    "--host", LLAMA_SERVER_HOST,
+                    "--port", str(LLAMA_SERVER_PORT),
+                    "-c", "2048",
+                ],
+                cwd=LLAMA_DIR,
+                env=env,
+                stdout=log_f,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+
+        deadline = time.time() + startup_timeout
+        while time.time() < deadline:
+            if _llama_server_healthy():
+                return
+            time.sleep(0.5)
+
+        raise RuntimeError(
+            f"llama-server did not become healthy within {startup_timeout}s. "
+            f"Check {LLAMA_SERVER_LOG} for details."
+        )
+
 
 def load_db():
     if os.path.exists(DB_FILE):
@@ -95,121 +170,43 @@ def api_generate_ai_summary(pid):
         f"Notes: {patient.get('doctor_notes', '')}."
     )
     clean_context = re.sub(r'[^a-zA-Z0-9 \.,:\-\(\)\%]', ' ', context)
-    
-    # TinyLlama native prompt format
-    prompt = f"<|system|>\nYou are a medical assistant. Summarize the patient in 3 concise bullet points.</s>\n<|user|>\n{clean_context}</s>\n<|assistant|>\n"
-    
-    # Write to a temporary file. This completely eliminates shell injection and hanging issues.
-    prompt_path = "/tmp/llama_prompt.txt"
-    with open(prompt_path, "w") as f:
-        f.write(prompt)
 
-    llama_dir = "/data/home/qnxuser/llama.cpp"
-    env = os.environ.copy()
-    env["LD_LIBRARY_PATH"] = os.path.join(llama_dir, "bin") + ":" + env.get("LD_LIBRARY_PATH", "")
-
-    # NOTE: the flag that actually disables conversation mode is "-no-cnv"
-    # (or the long form "--no-conversation"). "--no-cnv" is NOT a recognized
-    # alias and gets silently ignored, which is why the model was falling
-    # back into interactive/conversation mode (auto-enabled whenever the
-    # loaded GGUF has an embedded chat template, which TinyLlama-chat does).
-    # "-st" is added as a second safeguard: it forces the CLI to exit after
-    # a single turn even if conversation mode ends up active for any reason,
-    # instead of dropping back to a ">" prompt waiting on stdin forever.
-    cmd = [
-        "bin/llama-cli",
-        "-m", "models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
-        "-n", "120",
-        "-f", prompt_path,
-        "-no-cnv",
-        "-st",
-    ]
+    payload = {
+        "messages": [
+            {"role": "system", "content": "You are a medical assistant. Summarize the patient in 3 concise bullet points."},
+            {"role": "user", "content": clean_context},
+        ],
+        "max_tokens": 120,
+        "temperature": 0.2,
+        "stream": False,
+    }
 
     summary = ""
     try:
-        # No shell=True: this launches llama-cli as a single direct child
-        # process (no intermediate shell), and start_new_session=True puts
-        # it in its own process group so that if it ever does hang, we can
-        # reliably kill the whole group rather than risk an orphaned
-        # process left holding the stdout pipe open forever.
-        proc = subprocess.Popen(
-            cmd,
-            cwd=llama_dir,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            text=True,
-            start_new_session=True,
+        ensure_llama_server_running()
+
+        req = urllib.request.Request(
+            f"{LLAMA_SERVER_URL}/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
         )
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
 
-        output = None
-        try:
-            output, _ = proc.communicate(timeout=120)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            proc.communicate()
-            summary = "ERROR: Llama inference timed out (>120s)."
+        # llama-server's OpenAI-compatible endpoint applies the model's own
+        # chat template internally and returns just the generated text --
+        # no banner, no spinner, no ANSI codes, no shutdown diagnostics.
+        summary = data["choices"][0]["message"]["content"].strip()
+        if not summary:
+            summary = "AI inference completed but produced no output text."
 
-        if output is not None:
-            # Emulate a real terminal: a loading spinner (or any progress
-            # bar) is drawn by repeatedly overwriting the same line with
-            # "\r". A real TTY only ever shows what's after the LAST "\r"
-            # on a line; captured through a pipe, every intermediate frame
-            # survives as literal text instead (this is the source of the
-            # "|-\|/-\|/-\|/..." spinner garbage). Collapse that first.
-            def _collapse_carriage_returns(text):
-                return '\n'.join(
-                    line.split('\r')[-1] for line in text.split('\n')
-                )
-            output = _collapse_carriage_returns(output)
-
-            # Clean ANSI terminal color codes (which break string splitting)
-            ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-            output = ansi_escape.sub('', output)
-
-            # The loading spinner in this build is redrawn using ANSI
-            # cursor-movement codes rather than plain "\r". Stripping the
-            # escape codes above removes the *redraw instruction* but not
-            # the frames it was supposed to erase, so every spinner frame
-            # survives as literal text back-to-back (e.g. "|-\|/-\|/-\|...").
-            # A real summary never contains a long run of only |, /, -, \,
-            # so strip any such run outright regardless of what control
-            # sequence produced it. Threshold of 6+ avoids touching a
-            # legitimate lone hyphen or slash in normal text.
-            output = re.sub(r'[|/\\-]{6,}', '', output)
-
-            # Extract everything after the <|assistant|> tag
-            if "<|assistant|>" in output:
-                summary = output.split("<|assistant|>")[-1].strip()
-            else:
-                summary = output.strip()
-
-            # llama.cpp prints its own internal diagnostics at shutdown
-            # (llama_print_timings, llama_perf_context_print,
-            # llama_memory_breakdown_print, etc.). Rather than hardcoding
-            # each name, cut at the first line that starts with the
-            # "llama_..._print" pattern used by all of them.
-            diag_match = re.search(r'(?m)^llama_\w*_print', summary)
-            if diag_match:
-                summary = summary[:diag_match.start()].strip()
-
-            # Clean the separate perf-summary format (e.g. [ Prompt: 9.4 t/s | Generation: 4.6 t/s ])
-            if "[ Prompt:" in summary:
-                summary = summary.split("[ Prompt:")[0].strip()
-
-            summary = summary.replace("</s>", "").strip()
-
-            # Catch any leftover prompt arrow from the CLI
-            if summary.endswith(">"):
-                summary = summary[:-1].strip()
-
-            if not summary:
-                summary = "AI inference completed but produced no output text."
-
+    except urllib.error.URLError as e:
+        summary = f"ERROR: Could not reach llama-server: {e}"
+    except (KeyError, IndexError, json.JSONDecodeError) as e:
+        summary = f"ERROR: Unexpected response from llama-server: {e}"
+    except RuntimeError as e:
+        summary = f"ERROR: {e}"
     except Exception as e:
         summary = f"ERROR: Failed to run inference: {str(e)}"
 
@@ -516,4 +513,11 @@ function requestAiSummary() {
 
 if __name__ == '__main__':
     print("Starting History Server & AI Engine on port 5000...")
+    try:
+        print("Starting llama-server in the background (first load may take a few seconds)...")
+        ensure_llama_server_running()
+        print(f"llama-server is up at {LLAMA_SERVER_URL}")
+    except Exception as e:
+        print(f"WARNING: could not start llama-server up front ({e}); "
+              f"will retry lazily on first /ai_summary request.")
     app.run(host='0.0.0.0', port=5000)
