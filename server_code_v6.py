@@ -2,6 +2,7 @@
 import os
 import json
 import subprocess
+import signal
 import re
 from flask import Flask, jsonify, request, render_template_string, redirect, url_for, Response
 
@@ -103,56 +104,84 @@ def api_generate_ai_summary(pid):
     with open(prompt_path, "w") as f:
         f.write(prompt)
 
-    # Use -f to run in batch mode (bypasses interactive chat)
-    cmd = (
-        "cd /data/home/qnxuser/llama.cpp/ && "
-        "export LD_LIBRARY_PATH=`pwd`/bin:$LD_LIBRARY_PATH && "
-        f"bin/llama-cli -m models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf -n 120 -f {prompt_path} --no-cnv"
-    )
+    llama_dir = "/data/home/qnxuser/llama.cpp"
+    env = os.environ.copy()
+    env["LD_LIBRARY_PATH"] = os.path.join(llama_dir, "bin") + ":" + env.get("LD_LIBRARY_PATH", "")
 
+    # NOTE: the flag that actually disables conversation mode is "-no-cnv"
+    # (or the long form "--no-conversation"). "--no-cnv" is NOT a recognized
+    # alias and gets silently ignored, which is why the model was falling
+    # back into interactive/conversation mode (auto-enabled whenever the
+    # loaded GGUF has an embedded chat template, which TinyLlama-chat does).
+    # "-st" is added as a second safeguard: it forces the CLI to exit after
+    # a single turn even if conversation mode ends up active for any reason,
+    # instead of dropping back to a ">" prompt waiting on stdin forever.
+    cmd = [
+        "bin/llama-cli",
+        "-m", "models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
+        "-n", "120",
+        "-f", prompt_path,
+        "-no-cnv",
+        "-st",
+    ]
+
+    summary = ""
     try:
-        # stderr=subprocess.STDOUT merges all terminal output so we don't lose the generation
-        result = subprocess.run(
-            cmd, 
-            shell=True, 
+        # No shell=True: this launches llama-cli as a single direct child
+        # process (no intermediate shell), and start_new_session=True puts
+        # it in its own process group so that if it ever does hang, we can
+        # reliably kill the whole group rather than risk an orphaned
+        # process left holding the stdout pipe open forever.
+        proc = subprocess.Popen(
+            cmd,
+            cwd=llama_dir,
+            env=env,
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, 
-            stdin=subprocess.DEVNULL,  # <--- CRITICAL FIX: Stops the interactive prompt from hanging
-            text=True, 
-            timeout=120
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            start_new_session=True,
         )
-        
-        output = result.stdout
-        
-        # Clean ANSI terminal color codes (which break string splitting)
-        ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-        output = ansi_escape.sub('', output)
-        
-        # Extract everything after the <|assistant|> tag
-        if "<|assistant|>" in output:
-            summary = output.split("<|assistant|>")[-1].strip()
-        else:
-            summary = output.strip()
-            
-        # Clean legacy performance logs
-        if "llama_print_timings" in summary:
-            summary = summary.split("llama_print_timings")[0].strip()
-            
-        # FIX: Clean the new performance log format (e.g. [ Prompt: 9.4 t/s | Generation: 4.6 t/s ])
-        if "[ Prompt:" in summary:
-            summary = summary.split("[ Prompt:")[0].strip()
-            
-        summary = summary.replace("</s>", "").strip()
-        
-        # Catch any leftover prompt arrow from the CLI
-        if summary.endswith(">"):
-            summary = summary[:-1].strip()
 
-        if not summary:
-            summary = "AI inference completed but produced no output text."
-            
-    except subprocess.TimeoutExpired:
-        summary = "ERROR: Llama inference timed out (>120s)."
+        output = None
+        try:
+            output, _ = proc.communicate(timeout=120)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.communicate()
+            summary = "ERROR: Llama inference timed out (>120s)."
+
+        if output is not None:
+            # Clean ANSI terminal color codes (which break string splitting)
+            ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+            output = ansi_escape.sub('', output)
+
+            # Extract everything after the <|assistant|> tag
+            if "<|assistant|>" in output:
+                summary = output.split("<|assistant|>")[-1].strip()
+            else:
+                summary = output.strip()
+
+            # Clean legacy performance logs
+            if "llama_print_timings" in summary:
+                summary = summary.split("llama_print_timings")[0].strip()
+
+            # Clean the new performance log format (e.g. [ Prompt: 9.4 t/s | Generation: 4.6 t/s ])
+            if "[ Prompt:" in summary:
+                summary = summary.split("[ Prompt:")[0].strip()
+
+            summary = summary.replace("</s>", "").strip()
+
+            # Catch any leftover prompt arrow from the CLI
+            if summary.endswith(">"):
+                summary = summary[:-1].strip()
+
+            if not summary:
+                summary = "AI inference completed but produced no output text."
+
     except Exception as e:
         summary = f"ERROR: Failed to run inference: {str(e)}"
 
