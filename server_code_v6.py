@@ -176,7 +176,7 @@ def api_generate_ai_summary(pid):
             {"role": "system", "content": "You are a medical assistant. Summarize the patient in 3 concise bullet points."},
             {"role": "user", "content": clean_context},
         ],
-        "max_tokens": 120,
+        "max_tokens": 512,
         "temperature": 0.2,
         "stream": False,
     }
